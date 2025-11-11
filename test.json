@@ -1,0 +1,14 @@
+{
+  "main": {
+    "title": "At Your Service",
+    "lat": "14.557799",
+    "long": "121.02517",
+    "city": "City of Makati",
+    "province": "Metropolitan Manila",
+    "region": "National Capital Region (NCR)",
+    "location_code": "A01",
+    "site_classification": "Office",
+    "parking_type": "Underground",
+    "is_active": "true"
+  }
+}
