@@ -571,7 +571,7 @@ export default function CSVToJSONConverter() {
       const sectionObj = entry.data[sectionName] || {};
       Object.keys(sectionObj).forEach((col) => {
         // 'col' is lowercased header key
-        const key = `${sectionName}_${col}`;
+        const key = `${col}`;
         base[key] = sectionObj[col];
       });
     });
