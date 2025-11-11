@@ -24,11 +24,14 @@ import {
  *
  * Notes:
  * - Tailwind CSS and lucide-react are required.
+ *
+ * Fix: ensure route_url uses the evaluated title pattern (buildTitleFromPattern)
+ * with the proper row data, headers and index instead of calling it without args.
  */
 
 export default function CSVToJSONConverter() {
   const [file, setFile] = useState(null);
-  const [detectedHeaders, setDetectedHeaders] = useState([]); // exact headers as detected
+  const [detectedHeaders, setDetectedHeaders] = useState([]); // lowercased headers
   const [jsonData, setJsonData] = useState([]);
   const [status, setStatus] = useState({ type: "", message: "" });
   const [isProcessing, setIsProcessing] = useState(false);
@@ -44,6 +47,10 @@ export default function CSVToJSONConverter() {
   // columnMap maps headerLower -> sectionId (if missing -> goes to first section)
   const [columnMap, setColumnMap] = useState({});
 
+  // Title pattern state and UI helper
+  const [titlePattern, setTitlePattern] = useState("{title}"); // default as requested
+  const [newSectionName, setNewSectionName] = useState("");
+
   const reset = () => {
     setFile(null);
     setDetectedHeaders([]);
@@ -52,6 +59,7 @@ export default function CSVToJSONConverter() {
     setActivePreview("table");
     setSections([{ id: "main", name: "main", removable: true }]);
     setColumnMap({});
+    setTitlePattern("{title}");
   };
 
   // Simple CSV parser for a single line that handles quoted fields and doubled quotes.
@@ -78,6 +86,19 @@ export default function CSVToJSONConverter() {
     return result.map((v) => v.trim());
   };
 
+  // Helper to format a compact timestamp for patterns
+  const formatTimestampForPattern = (date = new Date()) => {
+    const pad = (n) => String(n).padStart(2, "0");
+    return (
+      date.getFullYear().toString() +
+      pad(date.getMonth() + 1) +
+      pad(date.getDate()) +
+      pad(date.getHours()) +
+      pad(date.getMinutes()) +
+      pad(date.getSeconds())
+    );
+  };
+
   // Read small slice and extract header line
   const extractHeadersFromFile = async (uploadedFile) => {
     try {
@@ -92,7 +113,9 @@ export default function CSVToJSONConverter() {
       const headers = parseCSVLine(firstLine).map((h, i) =>
         h ? h : `column_${i + 1}`
       );
-      setDetectedHeaders(headers);
+      // Store lowercased header keys for consistent use everywhere
+      const headersLower = headers.map((h) => String(h).toLowerCase());
+      setDetectedHeaders(headersLower);
       // Reset columnMap for new file
       setColumnMap({});
       // ensure at least one section exists
@@ -161,12 +184,6 @@ export default function CSVToJSONConverter() {
       // compute next sections list
       const next = prev.filter((s) => s.id !== id);
       let nextSections = next;
-      // if removal would leave no sections, create a fallback default
-      // if (nextSections.length === 0) {
-      //   nextSections = [
-      //     { id: "section_default", name: "section", removable: true },
-      //   ];
-      // }
       const fallbackId = nextSections?.[0]?.id;
       // reassign any columns mapped to this section back to fallback
       setColumnMap((prevMap) => {
@@ -181,6 +198,7 @@ export default function CSVToJSONConverter() {
   };
 
   const setColumnAssignment = (header, sectionId) => {
+    // header may be displayed lowercased already; ensure key is lowercase
     const key = String(header).toLowerCase();
     setColumnMap((prev) => {
       const next = { ...prev };
@@ -191,6 +209,73 @@ export default function CSVToJSONConverter() {
       }
       return next;
     });
+  };
+
+  // Resolve a pattern token against a row and current context
+  // Supports:
+  //  - title
+  //  - index
+  //  - timestamp
+  //  - column:HeaderName   (case-insensitive match to CSV headers)
+  //  - column_headername  (underscore variant)
+  const resolveToken = (token, rowObject, headersArray, rowIndex) => {
+    const t = String(token).trim();
+    if (t === "title") return rowObject.title ?? "";
+    if (t === "index") return String(rowIndex);
+    if (t === "timestamp") return formatTimestampForPattern(new Date());
+    // column:HeaderName
+    if (t.toLowerCase().startsWith("column:")) {
+      const headerName = t.slice("column:".length).trim();
+      if (!headerName) return "";
+      // headersArray contains lowercased headers, so compare lowercased
+      const target = headerName.toLowerCase();
+      const found = headersArray.find(
+        (h) => String(h).toLowerCase() === target
+      );
+      return found ? String(rowObject[found] ?? "") : "";
+    }
+    // column_headername (underscore) e.g. column_Author or column_name
+    if (t.toLowerCase().startsWith("column_")) {
+      const headerName = t.slice("column_".length).trim();
+      if (!headerName) return "";
+      const normalizedQuery = headerName.toLowerCase().replace(/\s+/g, "_");
+      const match = headersArray.find((h) => {
+        const normalizedH = String(h).toLowerCase().replace(/\s+/g, "_");
+        return normalizedH === normalizedQuery;
+      });
+      return match ? String(rowObject[match] ?? "") : "";
+    }
+    // fallback: try direct header name match (user may type {Author})
+    {
+      const match = headersArray.find(
+        (h) => String(h).toLowerCase() === t.toLowerCase()
+      );
+      if (match) return String(rowObject[match] ?? "");
+    }
+    return "";
+  };
+
+  // Build title from pattern and a row
+  const buildTitleFromPattern = (
+    pattern,
+    rowObject,
+    headersArray,
+    rowIndex
+  ) => {
+    if (!pattern || !String(pattern).trim()) return rowObject.title ?? "";
+    const pat = String(pattern);
+    // replace tokens like {token}
+    const tokens = pat.match(/\{([^\}]+)\}/g);
+    if (!tokens) return pat; // literal pattern with no tokens
+    let result = pat;
+    tokens.forEach((raw) => {
+      const token = raw.slice(1, -1);
+      const val = resolveToken(token, rowObject, headersArray, rowIndex);
+      // sanitize val (trim)
+      const safeVal = String(val ?? "").trim();
+      result = result.split(raw).join(safeVal);
+    });
+    return result;
   };
 
   const processCSV = async () => {
@@ -216,26 +301,32 @@ export default function CSVToJSONConverter() {
         return;
       }
 
-      const headers = parseCSVLine(lines[0]).map((h, i) =>
+      // Parse original headers, then create a lowercased header list for keys
+      const originalHeaders = parseCSVLine(lines[0]).map((h, i) =>
         h ? h : `column_${i + 1}`
       );
+      const headers = originalHeaders.map((h) => String(h).toLowerCase()); // lowercase keys used everywhere
 
       const transformed = [];
 
       // fallback default section id is first section in list
       const defaultSectionId = sections[0]?.id ?? "section_default";
 
+      // used for deduplication of generated titles
+      const titleCounts = {};
+
       for (let i = 1; i < lines.length; i++) {
         const values = parseCSVLine(lines[i]);
         while (values.length < headers.length) values.push("");
         if (values.length > headers.length) values.length = headers.length;
 
+        // Build a row object keyed by lowercased header names
         const row = {};
         headers.forEach((header, index) => {
           row[header] = values[index] ?? "";
         });
 
-        // build a sectioned data object, initialize sections by name
+        // build a sectioned data object (section names -> object of lowercase header keys)
         const sectionsData = {};
         sections.forEach((s) => {
           sectionsData[s.name] = {};
@@ -243,9 +334,7 @@ export default function CSVToJSONConverter() {
 
         // for each header, decide which section it belongs to
         // IMPORTANT: exclude 'title' and 'content' from being placed into sectionsData
-        headers.forEach((header) => {
-          const headerLower = String(header).toLowerCase();
-
+        headers.forEach((headerLower) => {
           // Skip base fields
           if (headerLower === "title" || headerLower === "content") {
             return;
@@ -255,16 +344,52 @@ export default function CSVToJSONConverter() {
           const targetSection =
             sections.find((s) => s.id === targetSectionId) || sections[0];
           const sectionName = targetSection.name;
-          sectionsData[sectionName][headerLower] = row[header] ?? "";
+
+          // store values under lowercase header keys
+          sectionsData[sectionName][headerLower] = row[headerLower] ?? "";
         });
 
+        // Build title using pattern (row index -> i because we started rows at line index 1, but provide 1-based row index)
+        const generatedBaseTitle = buildTitleFromPattern(
+          titlePattern,
+          row,
+          headers,
+          i // use the CSV line index as index value (1-based line number)
+        );
+
+        // Ensure uniqueness by appending incremental suffix if needed
+        const normalized = generatedBaseTitle || "";
+        if (!titleCounts[normalized]) {
+          titleCounts[normalized] = 1;
+        } else {
+          titleCounts[normalized] += 1;
+        }
+        let finalTitle = normalized;
+        if (titleCounts[normalized] > 1) {
+          // append -N where N is count - 1 to make title unique
+          finalTitle = `${normalized}-${titleCounts[normalized] - 1}`;
+        }
+
         const jsonEntry = {
-          title: row.title ?? "",
-          content: row.content ?? "",
+          title: finalTitle,
+          content: row["content"] ?? "",
           data: sectionsData,
         };
 
         transformed.push(jsonEntry);
+      }
+
+      // update detectedHeaders to the currently-parsed lowercase headers (for UI)
+      setDetectedHeaders(headers);
+
+      // small debug log so you can inspect in browser console what will be exported
+      try {
+        console.debug(
+          "CSV -> JSON transformed sample:",
+          transformed.slice(0, 3)
+        );
+      } catch (e) {
+        // ignore console issues in some runtimes
       }
 
       setJsonData(transformed);
@@ -282,7 +407,51 @@ export default function CSVToJSONConverter() {
     }
   };
 
+  // Decide if export allowed (must have at least one section defined)
+  const canExport = () => {
+    return jsonData.length > 0 && sections.length > 0;
+  };
+
+  const showExportBlockedModal = () => {
+    setModalContent({
+      title: "Export Error",
+      content:
+        "Cannot export because no sections are defined. Please add at least one section before exporting.",
+    });
+    setStatus({ type: "error", message: "No sections defined." });
+  };
+
+  // slugify helper used to build route fragments from generated titles/patterns
+  const slugify = (s) => {
+    return String(s ?? "")
+      .toLowerCase()
+      .replace(/[^\w\s-]/g, "")
+      .trim()
+      .replace(/\s+/g, "-");
+  };
+
+  // helper to reconstruct a flat row object from item.data (sectioned)
+  // returns object with lowercase header keys (same shape as used when parsing)
+  const reconstructRowFromItem = (item) => {
+    const flat = {};
+    Object.keys(item.data || {}).forEach((sectionName) => {
+      const sec = item.data[sectionName] || {};
+      Object.keys(sec).forEach((k) => {
+        flat[k] = sec[k];
+      });
+    });
+    // include title/content if present
+    if (item.title !== undefined) flat["title"] = item.title;
+    if (item.content !== undefined) flat["content"] = item.content;
+    return flat;
+  };
+
   const downloadJSON = () => {
+    if (!canExport()) {
+      showExportBlockedModal();
+      return;
+    }
+
     const timestamp = new Date().toISOString().replace(/[:.-]/g, "");
     if (jsonData.length === 0) {
       setStatus({ type: "error", message: "No data to download." });
@@ -310,19 +479,14 @@ export default function CSVToJSONConverter() {
   };
 
   const downloadCSV = () => {
-    const timestamp = new Date().toISOString().replace(/[:.-]/g, "");
-    if (jsonData.length === 0) {
-      setStatus({ type: "error", message: "No data to download." });
+    if (!canExport()) {
+      showExportBlockedModal();
       return;
     }
 
-    if (sections.length === 0) {
-      setStatus({ type: "error", message: "No sections defined." });
-      setModalContent({
-        title: "Export Error",
-        content:
-          "Cannot export CSV because no sections are defined. Please add at least one section before exporting.",
-      });
+    const timestamp = new Date().toISOString().replace(/[:.-]/g, "");
+    if (jsonData.length === 0) {
+      setStatus({ type: "error", message: "No data to download." });
       return;
     }
 
@@ -341,13 +505,28 @@ export default function CSVToJSONConverter() {
     const headersLower = baseHeaders.map((h) => String(h).toLowerCase());
     const csvRows = [headersLower.join(",")];
 
-    jsonData.forEach((item) => {
+    jsonData.forEach((item, idx) => {
+      // reconstruct a flat row (lowercased headers) so we can re-apply the title pattern
+      const flatRow = reconstructRowFromItem(item);
+
+      // Use the titlePattern to produce the string used in the route (this aligns the route with your pattern)
+      // Provide a rowIndex of idx+1 (1-based) for {index} tokens
+      const routeFromPattern = buildTitleFromPattern(
+        titlePattern,
+        flatRow,
+        detectedHeaders,
+        idx + 1
+      );
+
+      // fallback to item.title if pattern produced an empty string
+      const routeBase =
+        routeFromPattern && routeFromPattern.trim().length > 0
+          ? routeFromPattern
+          : item.title;
+
+      const routeTitle = slugify(routeBase);
+
       const dataJsonString = JSON.stringify(item.data);
-      const routeTitle = (item.title || "")
-        .toLowerCase()
-        .replace(/[^\w\s-]/g, "")
-        .trim()
-        .replace(/\s+/g, "-");
       const published_at = new Date().toISOString();
       const created_at = new Date().toISOString();
 
@@ -391,6 +570,7 @@ export default function CSVToJSONConverter() {
     Object.keys(entry.data || {}).forEach((sectionName) => {
       const sectionObj = entry.data[sectionName] || {};
       Object.keys(sectionObj).forEach((col) => {
+        // 'col' is lowercased header key
         const key = `${sectionName}_${col}`;
         base[key] = sectionObj[col];
       });
@@ -410,8 +590,67 @@ export default function CSVToJSONConverter() {
     return str.slice(0, n) + "…";
   };
 
-  // helpers for UI
-  const [newSectionName, setNewSectionName] = useState("");
+  // Helpers to append placeholder tokens to the pattern input (simple append)
+  const appendTokenToPattern = (token) => {
+    setTitlePattern((p) => `${p}${token}`);
+  };
+
+  // Small example of generated sample titles (first 3 rows) to show users how pattern behaves
+  const sampleGeneratedTitles = (() => {
+    try {
+      // if we have no detected headers or no file, just show examples using placeholders
+      if (
+        !detectedHeaders ||
+        detectedHeaders.length === 0 ||
+        jsonData.length === 0
+      ) {
+        return [
+          buildTitleFromPattern(
+            titlePattern,
+            { title: "Sample" },
+            detectedHeaders || [],
+            1
+          ),
+          buildTitleFromPattern(
+            titlePattern,
+            { title: "Sample" },
+            detectedHeaders || [],
+            2
+          ),
+          buildTitleFromPattern(
+            titlePattern,
+            { title: "Sample" },
+            detectedHeaders || [],
+            3
+          ),
+        ];
+      } else {
+        return jsonData.slice(0, 3).map((rowObj, idx) =>
+          buildTitleFromPattern(
+            titlePattern,
+            {
+              // build a faux rowObject with raw CSV data accessible by lowercase header name
+              ...Object.fromEntries(
+                Object.entries(rowObj.data).flatMap(
+                  ([sectionName, sectionData]) =>
+                    Object.entries(sectionData).map(([colName, val]) => [
+                      colName,
+                      val,
+                    ])
+                )
+              ),
+              title: rowObj.title,
+              content: rowObj.content,
+            },
+            detectedHeaders,
+            idx + 1
+          )
+        );
+      }
+    } catch {
+      return [];
+    }
+  })();
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-sky-50 p-8">
@@ -523,9 +762,9 @@ export default function CSVToJSONConverter() {
               <div className="mt-2 flex gap-2">
                 <button
                   onClick={downloadJSON}
-                  disabled={jsonData.length === 0}
+                  disabled={!canExport()}
                   className={`flex-1 inline-flex items-center gap-2 px-3 py-2 rounded-lg transition ${
-                    jsonData.length === 0
+                    !canExport()
                       ? "bg-slate-100 text-slate-400 cursor-not-allowed"
                       : "bg-emerald-600 text-white hover:bg-emerald-700"
                   }`}
@@ -536,9 +775,9 @@ export default function CSVToJSONConverter() {
 
                 <button
                   onClick={downloadCSV}
-                  disabled={jsonData.length === 0}
+                  disabled={!canExport()}
                   className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg transition ${
-                    jsonData.length === 0
+                    !canExport()
                       ? "bg-slate-100 text-slate-400 cursor-not-allowed"
                       : "bg-sky-600 text-white hover:bg-sky-700"
                   }`}
@@ -578,6 +817,91 @@ export default function CSVToJSONConverter() {
                   )}
                 </div>
               )}
+
+              {/* Title pattern input */}
+              <div className="mt-4 bg-white p-3 rounded-md border border-slate-100 text-sm">
+                <div className="flex items-center justify-between mb-2">
+                  <div className="font-medium text-slate-700">
+                    Title pattern
+                  </div>
+                  <div className="text-xs text-slate-400">Placeholders</div>
+                </div>
+
+                <div className="space-y-2">
+                  <input
+                    value={titlePattern}
+                    onChange={(e) => setTitlePattern(e.target.value)}
+                    placeholder="{title}"
+                    className="w-full px-2 py-1 border rounded text-sm text-gray-600"
+                  />
+                  <div className="text-xs text-slate-500">
+                    Use placeholders: <code>{"{title}"}</code>,{" "}
+                    <code>{"{index}"}</code>, <code>{"{timestamp}"}</code>, and
+                    column placeholders like <code>{"{column:Author}"}</code> or{" "}
+                    <code>{"{column_Author}"}</code>.
+                  </div>
+
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    <button
+                      onClick={() => appendTokenToPattern("{title}")}
+                      className="px-2 py-1 bg-slate-50 rounded text-xs hover:bg-slate-100 text-gray-600"
+                    >
+                      {`{title}`}
+                    </button>
+                    <button
+                      onClick={() => appendTokenToPattern("{index}")}
+                      className="px-2 py-1 bg-slate-50 rounded text-xs hover:bg-slate-100 text-gray-600"
+                    >
+                      {`{index}`}
+                    </button>
+                    <button
+                      onClick={() => appendTokenToPattern("{timestamp}")}
+                      className="px-2 py-1 bg-slate-50 rounded text-xs hover:bg-slate-100 text-gray-600"
+                    >
+                      {`{timestamp}`}
+                    </button>
+
+                    {detectedHeaders?.slice(0, 6).map((h) => (
+                      <button
+                        key={h}
+                        onClick={() => appendTokenToPattern(`{column:${h}}`)}
+                        className="px-2 py-1 bg-slate-50 rounded text-xs hover:bg-slate-100 text-gray-600"
+                        title={`Insert placeholder for column ${h}`}
+                      >
+                        {`{column:${h}}`}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="text-xs text-slate-500 mt-2">
+                    Examples:{" "}
+                    <span className="font-mono">{"{title}-{index}"}</span>,{" "}
+                    <span className="font-mono">{"{title}-{timestamp}"}</span>,{" "}
+                    <span className="font-mono">
+                      {"{title}-{column:author}"}
+                    </span>
+                  </div>
+
+                  <div className="mt-2 text-xs">
+                    <div className="font-medium text-slate-700 mb-1">
+                      Sample generated titles
+                    </div>
+                    <div className="bg-slate-50 p-2 rounded text-xs text-slate-600">
+                      {sampleGeneratedTitles.length > 0 ? (
+                        sampleGeneratedTitles.map((s, i) => (
+                          <div key={i} className="truncate">
+                            {i + 1}. {s}
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-slate-400">
+                          No preview available
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
 
               {/* Sections editor */}
               <div className="mt-4 bg-white p-3 rounded-md border border-slate-100 text-sm">
@@ -639,7 +963,7 @@ export default function CSVToJSONConverter() {
                   </div>
                   <div className="space-y-2 max-h-48 overflow-auto pr-2">
                     {detectedHeaders?.map((header) => {
-                      const key = header.toLowerCase();
+                      const key = header.toLowerCase(); // already lowercased but ensure
                       const assigned = columnMap[key] ?? sections?.[0]?.id;
                       return (
                         <div key={header} className="flex items-center gap-2">
@@ -787,7 +1111,7 @@ export default function CSVToJSONConverter() {
         </div>
       </div>
 
-      {/* Modal for viewing long cell content */}
+      {/* Modal for viewing long cell content or warnings */}
       {modalContent && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="bg-white rounded-lg max-w-3xl w-full shadow-lg">
